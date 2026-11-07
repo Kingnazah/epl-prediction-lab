@@ -1,0 +1,1 @@
+prediction_id,logged_at_utc,model_version,Season,Date,HomeTeam,AwayTeam,p_H,p_D,p_A,elo_H,elo_D,elo_A,dc_H,dc_D,dc_A,xg_home,xg_away,p_over25,p_btts,mkt_H,mkt_D,mkt_A,prev_hash,row_hash
