@@ -13,6 +13,8 @@ from epl_model import config
 from epl_model.data import (load_history, merge_results, seasons_in, standardise_fixtures, unknown_teams, KEY)
 from epl_model.engine import Engine
 from epl_model.tracking import (append_predictions, evaluate, load_log, reliability_note, verify_chain)
+from epl_model import counts as cn
+from epl_model import counts_tracking as ct
 
 ROOT = Path(__file__).parent
 st.set_page_config(page_title="EPL Prediction Lab", page_icon="⚽", layout="wide")
@@ -28,6 +30,8 @@ if "history" not in st.session_state:
     st.session_state.history = _default_history()
 if "log" not in st.session_state:
     st.session_state.log = load_log(ROOT / "data" / "predictions_log.csv")
+if "clog" not in st.session_state:
+    st.session_state.clog = ct.load_log(ROOT / "data" / "corners_log.csv")
 
 hist: pd.DataFrame = st.session_state.history
 
@@ -42,6 +46,11 @@ def run_ratings(history: pd.DataFrame) -> pd.DataFrame:
     return Engine(history).ratings()
 
 
+@st.cache_data(show_spinner="Fitting the corners model…")
+def run_corners(history: pd.DataFrame, fixtures: pd.DataFrame) -> pd.DataFrame:
+    return cn.CornersEngine(history).predict(fixtures)
+
+
 def pct(x) -> str:
     return "–" if pd.isna(x) else f"{x * 100:.1f}%"
 
@@ -54,8 +63,8 @@ st.warning("Research tool, not betting advice. In testing, this model was clearl
            "closing odds**, so it has no proven edge. Every number below is a probability, never a certainty.",
            icon="⚠️")
 
-tab_pred, tab_upd, tab_track, tab_rate, tab_about = st.tabs(
-    ["Predict", "Update results", "Tracking", "Ratings", "About"])
+tab_pred, tab_corn, tab_upd, tab_track, tab_rate, tab_about = st.tabs(
+    ["Predict", "Corners (experimental)", "Update results", "Tracking", "Ratings", "About"])
 
 recent = seasons_in(hist)[-2:]
 TEAMS = sorted(set(hist[hist.Season.isin(recent)].HomeTeam) | set(hist[hist.Season.isin(recent)].AwayTeam))
@@ -117,6 +126,7 @@ with tab_pred:
                         st.warning(f"Not in the history (check spelling, or newly promoted): {', '.join(bad)}. "
                                    "They are treated as average, with low reliability.")
                     st.session_state.preds = run_predict(hist, fx)
+                    st.session_state.fx_last = fx
             except Exception as e:  # noqa: BLE001
                 st.error(f"Could not make predictions: {e}")
 
@@ -191,6 +201,99 @@ with tab_pred:
         st.download_button("Download these predictions (CSV)", preds.drop(columns=["top_scores"]).to_csv(index=False),
                            "predictions.csv", "text/csv", key="dl_preds", width="stretch")
 
+# ================================================================== CORNERS
+with tab_corn:
+    st.subheader("Total corners per match (experimental)")
+    st.warning("**Weak signal.** In testing on 1,230 matches this model beat a league-average guess by only about "
+               "0.03 corners per match: small, but statistically detectable. No bookmaker corner odds were available "
+               "to test against, so it has **no proven betting value**. Any single over/under line stays close to a "
+               "coin flip.", icon="⚠️")
+    fxc = st.session_state.get("fx_last")
+    LINES = config.CORNERS["lines"]
+    if fxc is None or len(fxc) == 0:
+        st.info("Make predictions in the Predict tab first. The same fixtures are used here.")
+    else:
+        try:
+            cp = run_corners(hist, fxc)
+        except Exception as e:  # noqa: BLE001
+            cp = None
+            st.error(f"Could not make corner predictions: {e}")
+        if cp is not None and len(cp):
+            view = pd.DataFrame({
+                "Date": cp.Date.dt.strftime("%a %d %b"),
+                "Match": cp.HomeTeam + " v " + cp.AwayTeam,
+                "Expected total": cp.mu_total.round(1),
+                "Home (rough split)": cp.mu_home.round(1),
+                "Away (rough split)": cp.mu_away.round(1),
+                "League average": cp.mu_clim.round(1),
+                **{f"Over {L}": (cp[f"p_over_{L}"] * 100).round(0) for L in LINES}})
+            st.dataframe(view, hide_index=True, width="stretch",
+                         column_config={f"Over {L}": st.column_config.NumberColumn(f"Over {L} %", format="%.0f")
+                                        for L in LINES})
+            st.caption("“Over 9.5” means 10 or more corners in the match. The home/away split is a rough model "
+                       "estimate and has not been tested separately.")
+            if (cp["warnings"] != "").any():
+                st.warning("  \n".join(f"{m}: {w}" for m, w in zip(view["Match"], cp["warnings"]) if w))
+
+            pick = st.selectbox("See the full distribution for", list(range(len(cp))), key="corner_pick",
+                                format_func=lambda i: f"{cp.HomeTeam.iloc[i]} v {cp.AwayTeam.iloc[i]}")
+            r = cp.iloc[pick]
+            xs = np.arange(0, 27)
+            st.bar_chart(pd.DataFrame({"Probability (%)": cn.pmf(xs, r.mu_total, r.k) * 100}, index=xs))
+            sd = float(np.sqrt(r.mu_total + r.mu_total ** 2 / r.k))
+            st.caption(f"Expected {r.mu_total:.1f} corners, but the typical spread is about ±{sd:.1f}. "
+                       "That is why one line is rarely a confident call.")
+
+            if st.button("Log these corner predictions", key="clog_btn", width="stretch"):
+                new_log, rep = ct.append_predictions(st.session_state.clog, cp)
+                st.session_state.clog = new_log
+                msg = f"Logged {rep['added']} new corner prediction(s)."
+                if rep["already_logged"]:
+                    msg += f" {rep['already_logged']} already logged earlier (kept as they were)."
+                if rep["kickoff_passed"]:
+                    msg += f" {rep['kickoff_passed']} skipped because the kickoff date has passed."
+                st.success(msg)
+
+    st.markdown("---")
+    st.subheader("Corners track record")
+    st.caption("Predictions are scored against the league-average baseline stored with each prediction. "
+               "Matches need their corner counts entered (Update results tab) to be scored.")
+    cup = st.file_uploader("Restore a saved corners log (CSV you downloaded earlier)", type="csv", key="clog_upload")
+    if cup is not None and st.button("Use this corners log", key="use_clog"):
+        try:
+            cand = ct.load_log(cup)
+            ok, msg = ct.verify_chain(cand)
+            if ok:
+                st.session_state.clog = cand
+                st.success("Corners log restored. " + msg)
+            else:
+                st.error("This file failed the integrity check and was not loaded. " + msg)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the log: {e}")
+    clog = st.session_state.clog
+    if clog.empty:
+        st.info("Nothing logged yet.")
+    else:
+        ok, msg = ct.verify_chain(clog)
+        (st.success if ok else st.error)(("🔒 " if ok else "🚨 ") + msg)
+        cres = ct.evaluate(clog, hist)
+        if cres is None:
+            st.write(f"{len(clog)} logged, none settled yet.")
+        else:
+            st.write(ct.reliability_note(cres["n"]))
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Settled", cres["n"])
+            a2.metric("Average miss (corners)", f"{cres['mae']:.2f}", f"{cres['mae'] - cres['clim_mae']:+.2f} vs league avg",
+                      delta_color="inverse")
+            a3.metric("Log score (higher is better)", f"{cres['logscore']:.3f}",
+                      f"{cres['diff']:+.3f} vs league avg", delta_color="normal")
+            st.write(f"Average actual total {cres['actual_mean']:.2f} vs average predicted {cres['pred_mean']:.2f}.")
+            st.dataframe(cres["lines"].round(4), hide_index=True, width="stretch")
+        st.download_button("Download the corners log (keep a copy!)", clog.to_csv(index=False),
+                           "corners_log.csv", "text/csv", key="dl_clog", width="stretch")
+        st.caption("The free app forgets the log when it restarts. Download it after each session and upload it above "
+                   "next time (or commit it to GitHub as data/corners_log.csv).")
+
 # ================================================================== UPDATE RESULTS
 with tab_upd:
     st.subheader("Add new results")
@@ -218,7 +321,7 @@ with tab_upd:
     st.write("Option B: type results in by hand")
     dflt = pd.DataFrame({"Date": [dt.date.today()], "HomeTeam": [None], "AwayTeam": [None],
                          "FTHG": [None], "FTAG": [None], "HS": [np.nan], "AS": [np.nan],
-                         "HST": [np.nan], "AST": [np.nan]})
+                         "HST": [np.nan], "AST": [np.nan], "HC": [np.nan], "AC": [np.nan]})
     typed = st.data_editor(
         dflt, num_rows="dynamic", hide_index=True, width="stretch", key="res_editor",
         column_config={
@@ -231,8 +334,11 @@ with tab_upd:
             "AS": st.column_config.NumberColumn("Away shots", min_value=0, step=1),
             "HST": st.column_config.NumberColumn("Home on target", min_value=0, step=1),
             "AST": st.column_config.NumberColumn("Away on target", min_value=0, step=1),
+            "HC": st.column_config.NumberColumn("Home corners", min_value=0, step=1),
+            "AC": st.column_config.NumberColumn("Away corners", min_value=0, step=1),
         })
-    st.caption("Shots are optional; the model falls back to goals when they are missing.")
+    st.caption("Shots and corners are optional. Without shots the model falls back to goals; matches without "
+               "corner counts are simply skipped by the corners model, so enter them to keep it current.")
     if st.button("Add typed results", key="apply_typed"):
         try:
             tmp = typed.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
@@ -332,7 +438,11 @@ predicted match-by-match using only earlier results.
 - It knows nothing about injuries, suspensions, line-ups or tactics, which is the largest known gap.
 - Newly promoted teams and early-season matches are more uncertain.
 - Over 2.5 goals and Both Teams To Score are shown for interest only; in testing they were no better than base rates.
-- Corners and cards models are not built yet.
+- **Corners (experimental tab):** total corners per match, model corners-v1.0 (frozen 8 Nov 2026). Team attack/defence
+  effects with a negative-binomial total. On the same 1,230 test matches it beat a league-average guess by only a small
+  margin (average miss 2.71 vs 2.74 corners; probability quality +0.016, statistically detectable). No bookmaker corner odds
+  were available, so there is no market comparison and no proven betting value.
+- **Yellow cards:** tested, no reliable improvement over the league average (referee effect did not hold up), so they are not shown.
 - The exploratory promoted-team rule was designed after looking at test results; the live track record is the real check.
 - Bookmaker odds include a margin (about 4.7% on 1X2); even a perfect copy of the market loses that on average.
 
